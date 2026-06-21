@@ -30,6 +30,7 @@ from typing import Optional
 
 import discord
 from discord.ui import Button, Modal, TextInput, View
+from dotenv import load_dotenv
 
 
 # -----------------------------
