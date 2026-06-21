@@ -4,7 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="2db56418-e464-4431-a7fc-502e094e46f0" name="Changes" comment="X" />
+    <list default="true" id="2db56418-e464-4431-a7fc-502e094e46f0" name="Changes" comment="X">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -46,6 +49,7 @@
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "Python.discord.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "master",
     "last_opened_file_path": "/home/chasmyr/PycharmProjects/Chopper",
@@ -185,7 +189,31 @@
       <option name="project" value="LOCAL" />
       <updated>1782019836981</updated>
     </task>
-    <option name="localTasksCounter" value="15" />
+    <task id="LOCAL-00015" summary="X">
+      <option name="closed" value="true" />
+      <created>1782019846965</created>
+      <option name="number" value="00015" />
+      <option name="presentableId" value="LOCAL-00015" />
+      <option name="project" value="LOCAL" />
+      <updated>1782019846965</updated>
+    </task>
+    <task id="LOCAL-00016" summary="X">
+      <option name="closed" value="true" />
+      <created>1782020083997</created>
+      <option name="number" value="00016" />
+      <option name="presentableId" value="LOCAL-00016" />
+      <option name="project" value="LOCAL" />
+      <updated>1782020083997</updated>
+    </task>
+    <task id="LOCAL-00017" summary="X">
+      <option name="closed" value="true" />
+      <created>1782020128666</created>
+      <option name="number" value="00017" />
+      <option name="presentableId" value="LOCAL-00017" />
+      <option name="project" value="LOCAL" />
+      <updated>1782020128666</updated>
+    </task>
+    <option name="localTasksCounter" value="18" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
