@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-from rps.ui import Button, Modal, TextInput, View
-from dotenv import load_dotenv
+import discord
+from discord.ui import Button, Modal, TextInput, View
 
 
 # -----------------------------
