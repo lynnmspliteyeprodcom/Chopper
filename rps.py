@@ -27,8 +27,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-import chopper
-from chopper.ui import Button, Modal, TextInput, View
+
+from rps.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
 
 

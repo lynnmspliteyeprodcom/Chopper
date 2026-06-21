@@ -1,2 +1,2 @@
 #!/bin/bash
-python chopper.py
+python rps.py
