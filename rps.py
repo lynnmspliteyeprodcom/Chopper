@@ -1,12 +1,19 @@
 #Chopper, an RPS bot for BNS games
 #By Matthew Lynn, 6/20/2026
-#Test change2
+#v2.0.0
+
 
 """
-Rock, Paper, Scissors "Chop" Bot
+rps.py
 
-Command format:
+Discord Rock, Paper, Scissors "Chop" Bot
+
+Command examples:
     chop @player rock 7
+    chop reality rock 7
+    chop bot paper 4
+    chop help
+    chop ?
 
 Terms:
     Challenger - the player who starts the chop.
@@ -19,29 +26,43 @@ Rules:
     - If both players choose the same throw, compare test pools.
     - Test pool numbers are never shown publicly.
     - If both throw and test pool are tied, the Defender wins.
-    - The Defender has 4 minutes to respond.
-    - The public challenge message is edited/replaced as the chop progresses.
+    - Against Reality, Reality's test pool is -1, so tied throws favor the Challenger.
+    - Player Defenders have 4 minutes to respond.
+    - The bot edits/replaces the same public message during the challenge.
 """
 
-import os
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
 
+import os
+import random
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import discord
 from discord.ui import Button, Modal, TextInput, View
+from dotenv import load_dotenv
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Configuration
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 COMMAND_WORD = "chop"
+BOT_VERSION = "2.0.0"
+
+# Defender response window.
 CHOP_TIMEOUT_SECONDS = 240  # 4 minutes
+
+# Reality is the bot-controlled opponent.
+REALITY_NAME = "Reality"
+REALITY_KEYWORDS = {"reality", "bot"}
+
+# Reality should lose any tied throw, even if the Challenger enters 0.
+REALITY_TEST_POOL = -1
 
 VALID_THROWS = {"rock", "paper", "scissors"}
 
@@ -53,27 +74,42 @@ WIN_MAP = {
 }
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Discord Client Setup
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
+
+# Required because this bot uses a prefix command:
+#     chop @player rock 7
+#
+# This must also be enabled in the Discord Developer Portal.
 intents.message_content = True
+
+# Helpful for working with Discord members.
 intents.members = True
 
 client = discord.Client(intents=intents)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Data Model
-# -----------------------------
+# ---------------------------------------------------------------------------
+
+Player = Union[discord.Member, str]
+
 
 @dataclass
 class ChopState:
-    """Stores all private information needed to resolve one chop."""
+    """
+    Stores all information needed to resolve one chop.
+
+    The test pool values are intentionally kept private and are never shown
+    in the public result message.
+    """
 
     challenger: discord.Member
-    defender: discord.Member
+    defender: Player
 
     challenger_throw: str
     challenger_test_pool: int
@@ -83,14 +119,22 @@ class ChopState:
 
     message: Optional[discord.Message] = None
     resolved: bool = False
+    is_reality_challenge: bool = False
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Helper Functions
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 def normalize_throw(value: str) -> Optional[str]:
-    """Accepts full words and short aliases for throws."""
+    """
+    Converts player input into a valid throw.
+
+    Accepts:
+        rock, paper, scissors
+        r, p, s
+        scissor
+    """
 
     value = value.lower().strip()
 
@@ -109,18 +153,51 @@ def normalize_throw(value: str) -> Optional[str]:
     return None
 
 
-def format_throw(value: str) -> str:
+def format_throw(value: Optional[str]) -> str:
     """Formats a throw for public display."""
+
+    if value is None:
+        return "Unknown"
 
     return value.capitalize()
 
 
-def resolve_chop(state: ChopState) -> tuple[discord.Member, str]:
+def get_name(player: Player) -> str:
+    """
+    Returns a clean display name.
+
+    Discord members are shown as mentions.
+    Reality is shown as plain text.
+    """
+
+    if isinstance(player, str):
+        return player
+
+    return player.mention
+
+
+def get_player_id(player: Player) -> Optional[int]:
+    """
+    Returns a Discord user ID when the player is a Discord member.
+
+    Reality has no Discord user ID.
+    """
+
+    if isinstance(player, str):
+        return None
+
+    return player.id
+
+
+def resolve_chop(state: ChopState) -> tuple[Player, str]:
     """
     Resolves the chop.
 
     Returns:
         winner, reason
+
+    The public reason reveals whether the throw or test pool decided the
+    outcome, but never reveals test pool numbers.
     """
 
     challenger_throw = state.challenger_throw
@@ -129,7 +206,7 @@ def resolve_chop(state: ChopState) -> tuple[discord.Member, str]:
     if defender_throw is None or state.defender_test_pool is None:
         raise ValueError("Cannot resolve chop before Defender response is complete.")
 
-    # Normal RPS resolution.
+    # Normal Rock, Paper, Scissors resolution.
     if challenger_throw != defender_throw:
         if WIN_MAP[challenger_throw] == defender_throw:
             return (
@@ -149,7 +226,11 @@ def resolve_chop(state: ChopState) -> tuple[discord.Member, str]:
     if state.defender_test_pool > state.challenger_test_pool:
         return state.defender, "Victory secured by test pool."
 
-    # Same throw and same test pool: Defender wins.
+    # Same throw and same test pool: normal Defender advantage.
+    #
+    # Reality uses a test pool of -1, so this branch should not occur during
+    # Reality challenges unless the Challenger somehow enters -1, which the
+    # input validation rejects.
     return state.defender, "Complete tie. Advantage falls to the Defender."
 
 
@@ -158,23 +239,23 @@ def build_pending_message(state: ChopState) -> str:
 
     return (
         "**CHOP CHALLENGE**\n\n"
-        f"**Challenger:** {state.challenger.mention}\n"
-        f"**Defender:** {state.defender.mention}\n\n"
+        f"**Challenger:** {get_name(state.challenger)}\n"
+        f"**Defender:** {get_name(state.defender)}\n\n"
         "Awaiting Defender response.\n"
         "This challenge will expire in 4 minutes."
     )
 
 
-def build_result_message(state: ChopState, winner: discord.Member, reason: str) -> str:
+def build_result_message(state: ChopState, winner: Player, reason: str) -> str:
     """Creates the final public result message."""
 
     return (
         "**CHOP RESULT**\n\n"
-        f"**Challenger:** {state.challenger.mention}\n"
+        f"**Challenger:** {get_name(state.challenger)}\n"
         f"**Throw:** {format_throw(state.challenger_throw)}\n\n"
-        f"**Defender:** {state.defender.mention}\n"
+        f"**Defender:** {get_name(state.defender)}\n"
         f"**Throw:** {format_throw(state.defender_throw)}\n\n"
-        f"**Winner:** {winner.mention}\n\n"
+        f"**Winner:** {get_name(winner)}\n\n"
         f"**Reason:** {reason}"
     )
 
@@ -184,16 +265,34 @@ def build_expired_message(state: ChopState) -> str:
 
     return (
         "**CHOP CHALLENGE EXPIRED**\n\n"
-        f"**Challenger:** {state.challenger.mention}\n"
-        f"**Defender:** {state.defender.mention}\n\n"
+        f"**Challenger:** {get_name(state.challenger)}\n"
+        f"**Defender:** {get_name(state.defender)}\n\n"
         "**Result:** No contest.\n"
         "**Reason:** The Defender did not respond within 4 minutes."
     )
 
 
-# -----------------------------
+def parse_test_pool(value: str) -> Optional[int]:
+    """
+    Converts test pool input to a non-negative integer.
+
+    Returns None when the input is invalid.
+    """
+
+    try:
+        test_pool = int(value.strip())
+    except ValueError:
+        return None
+
+    if test_pool < 0:
+        return None
+
+    return test_pool
+
+
+# ---------------------------------------------------------------------------
 # Discord UI
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 class TestPoolModal(Modal):
     """Modal used to collect the Defender's private test pool."""
@@ -217,25 +316,20 @@ class TestPoolModal(Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """Records the Defender's test pool and resolves the chop."""
 
-        if interaction.user.id != self.state.defender.id:
+        defender_id = get_player_id(self.state.defender)
+
+        if defender_id is None or interaction.user.id != defender_id:
             await interaction.response.send_message(
                 "Only the Defender may respond to this challenge.",
                 ephemeral=True,
             )
             return
 
-        try:
-            defender_test_pool = int(str(self.test_pool_input.value).strip())
-        except ValueError:
-            await interaction.response.send_message(
-                "The test pool must be a whole number.",
-                ephemeral=True,
-            )
-            return
+        defender_test_pool = parse_test_pool(str(self.test_pool_input.value))
 
-        if defender_test_pool < 0:
+        if defender_test_pool is None:
             await interaction.response.send_message(
-                "The test pool cannot be negative.",
+                "The test pool must be a whole number of 0 or higher.",
                 ephemeral=True,
             )
             return
@@ -271,7 +365,9 @@ class ThrowButton(Button):
     async def callback(self, interaction: discord.Interaction) -> None:
         """Only allows the Defender to choose a throw."""
 
-        if interaction.user.id != self.state.defender.id:
+        defender_id = get_player_id(self.state.defender)
+
+        if defender_id is None or interaction.user.id != defender_id:
             await interaction.response.send_message(
                 "Only the Defender may answer this challenge.",
                 ephemeral=True,
@@ -317,80 +413,55 @@ class ChopView(View):
             )
 
 
-# -----------------------------
-# Command Handling
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Command Helpers
+# ---------------------------------------------------------------------------
 
-async def handle_chop_command(message: discord.Message) -> None:
+async def send_temporary_error(
+    channel: discord.abc.Messageable,
+    text: str,
+    delete_after: int = 12,
+) -> None:
+    """Sends a short-lived error message."""
+
+    await channel.send(text, delete_after=delete_after)
+
+
+async def send_chop_help(message: discord.Message) -> None:
+    """Displays syntax and rules for the Chop bot."""
+
+    help_text = (
+        "**CHOP HELP**\n\n"
+        "**Challenge another player:**\n"
+        "`chop @player rock 7`\n\n"
+        "**Challenge Reality:**\n"
+        "`chop reality rock 7`\n"
+        "`chop bot rock 7`\n\n"
+        "**Valid throws:**\n"
+        "`rock`, `paper`, `scissors`\n"
+        "Aliases: `r`, `p`, `s`\n\n"
+        "**Rules:**\n"
+        "• Rock defeats Scissors.\n"
+        "• Scissors defeats Paper.\n"
+        "• Paper defeats Rock.\n"
+        "• If both players choose the same throw, the higher test pool wins.\n"
+        "• Test pool numbers are never shown publicly.\n"
+        "• If both throw and test pool tie, advantage falls to the Defender.\n"
+        "• Against Reality, tied throws favor the Challenger.\n"
+        "• Player Defenders have 4 minutes to respond."
+    )
+
+    await message.channel.send(help_text)
+
+
+async def safely_delete_message(message: discord.Message) -> None:
     """
-    Handles:
-        chop @player rock 7
+    Deletes a message when possible.
+
+    This is important because the original command includes the Challenger's
+    throw and test pool.
     """
 
-    parts = message.content.split()
-
-    if len(parts) != 4:
-        await message.channel.send(
-            "Use this format: `chop @player rock 7`",
-            delete_after=12,
-        )
-        return
-
-    _, mention_text, throw_text, test_pool_text = parts
-
-    if not message.mentions:
-        await message.channel.send(
-            "You need to challenge a player, like this: `chop @player rock 7`",
-            delete_after=12,
-        )
-        return
-
-    challenger = message.author
-    defender = message.mentions[0]
-
-    if defender.bot:
-        await message.channel.send(
-            "You cannot challenge a bot with this command.",
-            delete_after=12,
-        )
-        return
-
-    if defender.id == challenger.id:
-        await message.channel.send(
-            "You cannot challenge yourself. The mirror refuses to play.",
-            delete_after=12,
-        )
-        return
-
-    challenger_throw = normalize_throw(throw_text)
-
-    if challenger_throw is None:
-        await message.channel.send(
-            "Valid throws are `rock`, `paper`, or `scissors`.",
-            delete_after=12,
-        )
-        return
-
-    try:
-        challenger_test_pool = int(test_pool_text)
-    except ValueError:
-        await message.channel.send(
-            "The test pool must be a whole number.",
-            delete_after=12,
-        )
-        return
-
-    if challenger_test_pool < 0:
-        await message.channel.send(
-            "The test pool cannot be negative.",
-            delete_after=12,
-        )
-        return
-
-    # Delete the command message so the Challenger's throw and test pool
-    # are not left sitting in the channel.
-    #
-    # This requires the bot to have Manage Messages permission.
     try:
         await message.delete()
     except discord.Forbidden:
@@ -399,7 +470,65 @@ async def handle_chop_command(message: discord.Message) -> None:
             delete_after=12,
         )
     except discord.HTTPException:
+        # Ignore transient Discord API errors.
         pass
+
+
+async def handle_reality_challenge(
+    message: discord.Message,
+    challenger_throw: str,
+    challenger_test_pool: int,
+) -> None:
+    """
+    Resolves a chop directly against Reality.
+
+    Reality does not use buttons or modals. The bot immediately chooses a
+    random throw and uses a test pool of -1.
+    """
+
+    state = ChopState(
+        challenger=message.author,
+        defender=REALITY_NAME,
+        challenger_throw=challenger_throw,
+        challenger_test_pool=challenger_test_pool,
+        defender_throw=random.choice(sorted(VALID_THROWS)),
+        defender_test_pool=REALITY_TEST_POOL,
+        resolved=True,
+        is_reality_challenge=True,
+    )
+
+    winner, reason = resolve_chop(state)
+    result_message = build_result_message(state, winner, reason)
+
+    await safely_delete_message(message)
+    await message.channel.send(result_message)
+
+
+async def handle_player_challenge(
+    message: discord.Message,
+    defender: discord.Member,
+    challenger_throw: str,
+    challenger_test_pool: int,
+) -> None:
+    """Creates a player-vs-player challenge."""
+
+    challenger = message.author
+
+    if defender.bot:
+        await send_temporary_error(
+            message.channel,
+            "You cannot challenge a bot with this command. Use `chop reality rock 7` instead.",
+        )
+        return
+
+    if defender.id == challenger.id:
+        await send_temporary_error(
+            message.channel,
+            "You cannot challenge yourself. The mirror refuses to play.",
+        )
+        return
+
+    await safely_delete_message(message)
 
     state = ChopState(
         challenger=challenger,
@@ -418,9 +547,87 @@ async def handle_chop_command(message: discord.Message) -> None:
     state.message = challenge_message
 
 
-# -----------------------------
+async def handle_chop_command(message: discord.Message) -> None:
+    """
+    Handles all chop commands.
+
+    Supported:
+        chop @player rock 7
+        chop reality rock 7
+        chop bot rock 7
+        chop help
+        chop ?
+    """
+
+    parts = message.content.split()
+
+    if len(parts) >= 2 and parts[1].lower() in {"help", "?"}:
+        await send_chop_help(message)
+        return
+
+    if len(parts) >= 2 and parts[1].lower() == "version":
+        await message.channel.send(f"RPS Bot Version: v{BOT_VERSION}")
+        return
+
+    if len(parts) != 4:
+        await send_temporary_error(
+            message.channel,
+            "Use this format: `chop @player rock 7` or `chop reality rock 7`.",
+        )
+        return
+
+    _, target_text, throw_text, test_pool_text = parts
+
+    challenger_throw = normalize_throw(throw_text)
+
+    if challenger_throw is None:
+        await send_temporary_error(
+            message.channel,
+            "Valid throws are `rock`, `paper`, or `scissors`.",
+        )
+        return
+
+    challenger_test_pool = parse_test_pool(test_pool_text)
+
+    if challenger_test_pool is None:
+        await send_temporary_error(
+            message.channel,
+            "The test pool must be a whole number of 0 or higher.",
+        )
+        return
+
+    # Reality challenge.
+    #
+    # Check this before mention handling so the keyword is reserved and
+    # behaves predictably.
+    if target_text.lower() in REALITY_KEYWORDS:
+        await handle_reality_challenge(
+            message=message,
+            challenger_throw=challenger_throw,
+            challenger_test_pool=challenger_test_pool,
+        )
+        return
+
+    if not message.mentions:
+        await send_temporary_error(
+            message.channel,
+            "You need to challenge a player, like this: `chop @player rock 7`.",
+        )
+        return
+
+    defender = message.mentions[0]
+
+    await handle_player_challenge(
+        message=message,
+        defender=defender,
+        challenger_throw=challenger_throw,
+        challenger_test_pool=challenger_test_pool,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Discord Events
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 @client.event
 async def on_ready() -> None:
@@ -442,9 +649,9 @@ async def on_message(message: discord.Message) -> None:
     await handle_chop_command(message)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Startup
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from the .env file.")

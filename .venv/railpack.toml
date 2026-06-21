@@ -1,3 +1,10 @@
 [python]
 virtualenv = false
 
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python rps.py"
+
+NIXPACKS_PYTHON_VERSION=3.12
