@@ -27,8 +27,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-import discord
-from discord.ui import Button, Modal, TextInput, View
+import chopper
+from chopper.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
 
 
