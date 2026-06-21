@@ -1,6 +1,8 @@
 discord.py
+
 python-dotenv
 
 discord.py==2.7.1
+
 python-dotenv==1.1.1
 
