@@ -1,18 +1,25 @@
 #Chopper, an RPS bot for BNS games
 #By Matthew Lynn, 6/20/2026
-#v2.0.1
+#v2.0.4
 
 """
 rps.py
 
 Discord Rock, Paper, Scissors "Chop" Bot
 
+Version:
+    v2.0.4
+
 Command examples:
-    chop @player rock 7
-    chop reality rock 7
-    chop bot paper 4
+    chop
     chop help
     chop ?
+    chop version
+    chop permissions
+    chop @player rock 7
+    chop @player rock
+    chop reality rock 7
+    chop bot paper
 
 Terms:
     Challenger - the player who starts the chop.
@@ -26,6 +33,8 @@ Rules:
     - Test pool numbers are never shown publicly.
     - If both throw and test pool are tied, the Defender wins.
     - Against Reality, Reality's test pool is -1, so tied throws favor the Challenger.
+    - A Defender may Relent, which causes an automatic loss.
+    - If a Challenger omits the test pool, it defaults to 0.
     - Player Defenders have 4 minutes to respond.
     - The bot edits/replaces the same public message during the challenge.
 """
@@ -51,6 +60,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 COMMAND_WORD = "chop"
+BOT_VERSION = "2.0.4"
 
 # Defender response window.
 CHOP_TIMEOUT_SECONDS = 240  # 4 minutes
@@ -71,15 +81,18 @@ WIN_MAP = {
     "scissors": "paper",
 }
 
-
-
-# Permissions required for the bot to operate correctly.
+# Permissions required for Chopper to operate correctly.
+#
+# Manage Messages is especially important because the original chop command
+# contains the Challenger's throw and test pool. Without it, the command may
+# remain visible in the channel and compromise the chop.
 REQUIRED_PERMISSIONS = {
     "View Channels": "view_channel",
     "Send Messages": "send_messages",
     "Read Message History": "read_message_history",
     "Manage Messages": "manage_messages",
 }
+
 
 # ---------------------------------------------------------------------------
 # Discord Client Setup
@@ -127,6 +140,9 @@ class ChopState:
     message: Optional[discord.Message] = None
     resolved: bool = False
     is_reality_challenge: bool = False
+    challenger_defaulted_test_pool: bool = False
+    defender_defaulted_test_pool: bool = False
+    defender_relented: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +219,12 @@ def resolve_chop(state: ChopState) -> tuple[Player, str]:
     Returns:
         winner, reason
 
-    The public reason reveals whether the throw or test pool decided the
-    outcome, but never reveals test pool numbers.
+    The public reason reveals whether the throw, test pool, or Relent decided
+    the outcome, but never reveals test pool numbers.
     """
+
+    if state.defender_relented:
+        return state.challenger, "Defender relented."
 
     challenger_throw = state.challenger_throw
     defender_throw = state.defender_throw
@@ -234,11 +253,29 @@ def resolve_chop(state: ChopState) -> tuple[Player, str]:
         return state.defender, "Victory secured by test pool."
 
     # Same throw and same test pool: normal Defender advantage.
-    #
-    # Reality uses a test pool of -1, so this branch should not occur during
-    # Reality challenges unless the Challenger somehow enters -1, which the
-    # input validation rejects.
     return state.defender, "Complete tie. Advantage falls to the Defender."
+
+
+def build_notes(state: ChopState) -> str:
+    """
+    Builds public notes for defaulted values.
+
+    Test pool numbers are not shown, but players are told when a missing
+    test pool was treated as 0.
+    """
+
+    notes = []
+
+    if state.challenger_defaulted_test_pool:
+        notes.append("Challenger test pool was not entered and defaulted to 0.")
+
+    if state.defender_defaulted_test_pool:
+        notes.append("Defender test pool was not entered and defaulted to 0.")
+
+    if not notes:
+        return ""
+
+    return "\n\n**Notes:**\n" + "\n".join(f"• {note}" for note in notes)
 
 
 def build_pending_message(state: ChopState) -> str:
@@ -256,14 +293,17 @@ def build_pending_message(state: ChopState) -> str:
 def build_result_message(state: ChopState, winner: Player, reason: str) -> str:
     """Creates the final public result message."""
 
+    defender_throw = "Relented" if state.defender_relented else format_throw(state.defender_throw)
+
     return (
         "**CHOP RESULT**\n\n"
         f"**Challenger:** {get_name(state.challenger)}\n"
         f"**Throw:** {format_throw(state.challenger_throw)}\n\n"
         f"**Defender:** {get_name(state.defender)}\n"
-        f"**Throw:** {format_throw(state.defender_throw)}\n\n"
+        f"**Throw:** {defender_throw}\n\n"
         f"**Winner:** {get_name(winner)}\n\n"
         f"**Reason:** {reason}"
+        f"{build_notes(state)}"
     )
 
 
@@ -279,22 +319,28 @@ def build_expired_message(state: ChopState) -> str:
     )
 
 
-def parse_test_pool(value: str) -> Optional[int]:
+def parse_test_pool(value: Optional[str]) -> tuple[int, bool]:
     """
     Converts test pool input to a non-negative integer.
 
-    Returns None when the input is invalid.
+    Returns:
+        test_pool, defaulted
+
+    If the value is missing or blank, the test pool defaults to 0.
     """
+
+    if value is None or value.strip() == "":
+        return 0, True
 
     try:
         test_pool = int(value.strip())
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise ValueError("The test pool must be a whole number of 0 or higher.") from exc
 
     if test_pool < 0:
-        return None
+        raise ValueError("The test pool must be a whole number of 0 or higher.")
 
-    return test_pool
+    return test_pool, False
 
 
 
@@ -302,54 +348,145 @@ def parse_test_pool(value: str) -> Optional[int]:
 # Permission Checks
 # ---------------------------------------------------------------------------
 
-async def send_permission_report(message: discord.Message) -> None:
-    if message.guild is None:
-        await message.channel.send("Permission checks can only be run in a server.")
+def get_permission_status(
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel,
+) -> list[tuple[str, bool, bool]]:
+    """
+    Returns verbose permission status for the bot.
+
+    Each row contains:
+        permission display name, server-level result, channel-level result
+
+    Server-level permissions tell us whether the bot has the permission from
+    its roles. Channel-level permissions tell us whether channel overwrites are
+    allowing or blocking that permission in the current channel.
+    """
+
+    if guild.me is None:
+        return [("Unable to identify bot member in this server.", False, False)]
+
+    server_permissions = guild.me.guild_permissions
+    channel_permissions = channel.permissions_for(guild.me)
+
+    status = []
+
+    for display_name, permission_attribute in REQUIRED_PERMISSIONS.items():
+        server_ok = getattr(server_permissions, permission_attribute)
+        channel_ok = getattr(channel_permissions, permission_attribute)
+        status.append((display_name, server_ok, channel_ok))
+
+    return status
+
+
+def get_missing_guild_permissions(guild: discord.Guild) -> list[str]:
+    """
+    Returns required permissions missing at the server level.
+
+    This is used for startup diagnostics. It does not catch channel overwrites;
+    `chop permissions` handles that by checking the current channel too.
+    """
+
+    if guild.me is None:
+        return ["Unable to identify bot member in this server."]
+
+    missing_permissions = []
+    permissions = guild.me.guild_permissions
+
+    for display_name, permission_attribute in REQUIRED_PERMISSIONS.items():
+        if not getattr(permissions, permission_attribute):
+            missing_permissions.append(display_name)
+
+    return missing_permissions
+
+
+async def check_permissions_on_startup() -> None:
+    """
+    Prints a server-level permission report when the bot starts.
+
+    This gives the host immediate feedback in the console if the bot is missing
+    something important before players begin testing.
+    """
+
+    print("=" * 60)
+    print("Chopper Permission Check")
+
+    if not client.guilds:
+        print("The bot is not currently connected to any servers.")
+        print("=" * 60)
         return
 
-    me = message.guild.me
-    guild_perms = me.guild_permissions
-    channel_perms = message.channel.permissions_for(me)
+    any_missing = False
+
+    for guild in client.guilds:
+        missing_permissions = get_missing_guild_permissions(guild)
+
+        if missing_permissions:
+            any_missing = True
+            print(f"WARNING: {guild.name} is missing server-level permissions:")
+            for permission in missing_permissions:
+                print(f"  - {permission}")
+        else:
+            print(f"{guild.name}: Server-level permission check passed.")
+
+    if not any_missing:
+        print("All server-level permission checks passed.")
+
+    print("=" * 60)
+
+
+async def send_permission_report(message: discord.Message) -> None:
+    """
+    Sends a verbose permission report for the current channel.
+
+    Command:
+        chop permissions
+    """
+
+    if message.guild is None:
+        await message.channel.send(
+            "Permission checks can only be run inside a server channel."
+        )
+        return
+
+    status_rows = get_permission_status(message.guild, message.channel)
 
     lines = [
         f"**Chopper Permissions — v{BOT_VERSION}**",
         "",
-        "**Verbose Report**",
-        ""
+        "**Verbose Permission Report**",
+        f"**Server:** {message.guild.name}",
+        f"**Channel:** {message.channel.mention}",
+        "",
     ]
 
-    problems = False
+    problems_found = False
 
-    for display_name, attr in REQUIRED_PERMISSIONS.items():
-        server_ok = getattr(guild_perms, attr)
-        channel_ok = getattr(channel_perms, attr)
-
+    for display_name, server_ok, channel_ok in status_rows:
         if not server_ok or not channel_ok:
-            problems = True
+            problems_found = True
 
         lines.append(f"**{display_name}**")
-        lines.append(f"  Server: {'✓' if server_ok else '✗'}")
-        lines.append(f"  Channel: {'✓' if channel_ok else '✗'}")
+        lines.append(f"Server: {'✓' if server_ok else '✗'}")
+        lines.append(f"Channel: {'✓' if channel_ok else '✗'}")
+        lines.append("")
 
-    lines.append("")
-    lines.append("Result: Permission check passed." if not problems else "Result: Missing permissions detected.")
+    if problems_found:
+        lines.append("**Result:** Missing permissions detected.")
+        lines.append("")
+        lines.append(
+            "If Server is ✓ but Channel is ✗, a channel override is blocking the bot."
+        )
+        lines.append(
+            "If Server is ✗, update the bot role or invite permissions."
+        )
+        lines.append(
+            "Manage Messages is required to hide the Challenger's original chop."
+        )
+    else:
+        lines.append("**Result:** Permission check passed.")
 
     await message.channel.send("\n".join(lines))
-
-async def check_permissions_on_startup() -> None:
-    print("=" * 60)
-    print("Chopper Permission Check")
-    for guild in client.guilds:
-        me = guild.me
-        missing = []
-        for display_name, attr in REQUIRED_PERMISSIONS.items():
-            if not getattr(me.guild_permissions, attr):
-                missing.append(display_name)
-        if missing:
-            print(f"{guild.name}: Missing -> {', '.join(missing)}")
-        else:
-            print(f"{guild.name}: Permission check passed.")
-    print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +504,9 @@ class TestPoolModal(Modal):
 
         self.test_pool_input = TextInput(
             label="Test Pool",
-            placeholder="Enter your test pool number",
-            required=True,
-            min_length=1,
+            placeholder="Enter your test pool number, or leave blank for 0",
+            required=False,
+            min_length=0,
             max_length=6,
         )
 
@@ -387,17 +524,18 @@ class TestPoolModal(Modal):
             )
             return
 
-        defender_test_pool = parse_test_pool(str(self.test_pool_input.value))
-
-        if defender_test_pool is None:
+        try:
+            defender_test_pool, defaulted = parse_test_pool(str(self.test_pool_input.value))
+        except ValueError as exc:
             await interaction.response.send_message(
-                "The test pool must be a whole number of 0 or higher.",
+                str(exc),
                 ephemeral=True,
             )
             return
 
         self.state.defender_throw = self.defender_throw
         self.state.defender_test_pool = defender_test_pool
+        self.state.defender_defaulted_test_pool = defaulted
         self.state.resolved = True
 
         winner, reason = resolve_chop(self.state)
@@ -443,8 +581,51 @@ class ThrowButton(Button):
             )
             return
 
-        await interaction.response.send_modal(
-            TestPoolModal(self.state, self.throw)
+        await interaction.response.send_modal(TestPoolModal(self.state, self.throw))
+
+
+class RelentButton(Button):
+    """Button that lets the Defender concede the chop."""
+
+    def __init__(self, state: ChopState):
+        super().__init__(
+            label="Relent",
+            style=discord.ButtonStyle.danger,
+        )
+
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Resolves the chop as an automatic Challenger win."""
+
+        defender_id = get_player_id(self.state.defender)
+
+        if defender_id is None or interaction.user.id != defender_id:
+            await interaction.response.send_message(
+                "Only the Defender may answer this challenge.",
+                ephemeral=True,
+            )
+            return
+
+        if self.state.resolved:
+            await interaction.response.send_message(
+                "This challenge has already been resolved.",
+                ephemeral=True,
+            )
+            return
+
+        self.state.defender_relented = True
+        self.state.resolved = True
+
+        winner, reason = resolve_chop(self.state)
+        result_message = build_result_message(self.state, winner, reason)
+
+        if self.state.message:
+            await self.state.message.edit(content=result_message, view=None)
+
+        await interaction.response.send_message(
+            "You have relented.",
+            ephemeral=True,
         )
 
 
@@ -459,6 +640,7 @@ class ChopView(View):
         self.add_item(ThrowButton("rock", state))
         self.add_item(ThrowButton("paper", state))
         self.add_item(ThrowButton("scissors", state))
+        self.add_item(RelentButton(state))
 
     async def on_timeout(self) -> None:
         """Expires the challenge after 4 minutes."""
@@ -493,12 +675,17 @@ async def send_chop_help(message: discord.Message) -> None:
     """Displays syntax and rules for the Chop bot."""
 
     help_text = (
-        "**CHOP HELP**\n\n"
+        f"**CHOP HELP — v{BOT_VERSION}**\n\n"
         "**Challenge another player:**\n"
-        "`chop @player rock 7`\n\n"
+        "`chop @player rock 7`\n"
+        "`chop @player rock` — test pool defaults to 0\n\n"
         "**Challenge Reality:**\n"
         "`chop reality rock 7`\n"
-        "`chop bot rock 7`\n\n"
+        "`chop bot rock` — test pool defaults to 0\n\n"
+        "**Other commands:**\n"
+        "`chop help`\n"
+        "`chop ?`\n"
+        "`chop version`\n\n"
         "**Valid throws:**\n"
         "`rock`, `paper`, `scissors`\n"
         "Aliases: `r`, `p`, `s`\n\n"
@@ -508,7 +695,9 @@ async def send_chop_help(message: discord.Message) -> None:
         "• Paper defeats Rock.\n"
         "• If both players choose the same throw, the higher test pool wins.\n"
         "• Test pool numbers are never shown publicly.\n"
+        "• If a test pool is not entered, it defaults to 0.\n"
         "• If both throw and test pool tie, advantage falls to the Defender.\n"
+        "• The Defender may Relent, which is an automatic loss.\n"
         "• Against Reality, tied throws favor the Challenger.\n"
         "• Player Defenders have 4 minutes to respond."
     )
@@ -521,7 +710,7 @@ async def safely_delete_message(message: discord.Message) -> None:
     Deletes a message when possible.
 
     This is important because the original command includes the Challenger's
-    throw and test pool.
+    throw and possibly their test pool.
     """
 
     try:
@@ -540,6 +729,7 @@ async def handle_reality_challenge(
     message: discord.Message,
     challenger_throw: str,
     challenger_test_pool: int,
+    challenger_defaulted_test_pool: bool,
 ) -> None:
     """
     Resolves a chop directly against Reality.
@@ -557,6 +747,7 @@ async def handle_reality_challenge(
         defender_test_pool=REALITY_TEST_POOL,
         resolved=True,
         is_reality_challenge=True,
+        challenger_defaulted_test_pool=challenger_defaulted_test_pool,
     )
 
     winner, reason = resolve_chop(state)
@@ -571,6 +762,7 @@ async def handle_player_challenge(
     defender: discord.Member,
     challenger_throw: str,
     challenger_test_pool: int,
+    challenger_defaulted_test_pool: bool,
 ) -> None:
     """Creates a player-vs-player challenge."""
 
@@ -597,6 +789,7 @@ async def handle_player_challenge(
         defender=defender,
         challenger_throw=challenger_throw,
         challenger_test_pool=challenger_test_pool,
+        challenger_defaulted_test_pool=challenger_defaulted_test_pool,
     )
 
     view = ChopView(state)
@@ -614,44 +807,70 @@ async def handle_chop_command(message: discord.Message) -> None:
     Handles all chop commands.
 
     Supported:
+        chop
+        chop @player rock
         chop @player rock 7
+        chop reality rock
         chop reality rock 7
+        chop bot rock
         chop bot rock 7
         chop help
         chop ?
+        chop version
+        chop permissions
     """
 
     parts = message.content.split()
 
-    if len(parts) >= 2 and parts[1].lower() in {"help", "?"}:
+    # Bare "chop" should behave exactly like help.
+    if len(parts) == 1:
         await send_chop_help(message)
         return
 
-    if len(parts) != 4:
+    subcommand = parts[1].lower()
+
+    if subcommand in {"help", "?"}:
+        await send_chop_help(message)
+        return
+
+    if subcommand == "version":
+        await message.channel.send(f"Chopper Version: v{BOT_VERSION}")
+        return
+
+    if subcommand == "permissions":
+        await send_permission_report(message)
+        return
+
+    # Valid challenge forms are:
+    #     chop @player rock
+    #     chop @player rock 7
+    #     chop reality rock
+    #     chop reality rock 7
+    if len(parts) not in {3, 4}:
         await send_temporary_error(
             message.channel,
-            "Use this format: `chop @player rock 7` or `chop reality rock 7`.",
+            "Use `chop help` for syntax.",
         )
         return
 
-    _, target_text, throw_text, test_pool_text = parts
+    _, target_text, throw_text, *test_pool_parts = parts
 
     challenger_throw = normalize_throw(throw_text)
 
+    # If no rock/paper/scissors value is entered, tell the user and close out.
     if challenger_throw is None:
         await send_temporary_error(
             message.channel,
-            "Valid throws are `rock`, `paper`, or `scissors`.",
+            "No valid throw was entered. Use `rock`, `paper`, or `scissors`.",
         )
         return
 
-    challenger_test_pool = parse_test_pool(test_pool_text)
+    test_pool_text = test_pool_parts[0] if test_pool_parts else None
 
-    if challenger_test_pool is None:
-        await send_temporary_error(
-            message.channel,
-            "The test pool must be a whole number of 0 or higher.",
-        )
+    try:
+        challenger_test_pool, challenger_defaulted = parse_test_pool(test_pool_text)
+    except ValueError as exc:
+        await send_temporary_error(message.channel, str(exc))
         return
 
     # Reality challenge.
@@ -663,6 +882,7 @@ async def handle_chop_command(message: discord.Message) -> None:
             message=message,
             challenger_throw=challenger_throw,
             challenger_test_pool=challenger_test_pool,
+            challenger_defaulted_test_pool=challenger_defaulted,
         )
         return
 
@@ -680,6 +900,7 @@ async def handle_chop_command(message: discord.Message) -> None:
         defender=defender,
         challenger_throw=challenger_throw,
         challenger_test_pool=challenger_test_pool,
+        challenger_defaulted_test_pool=challenger_defaulted,
     )
 
 
@@ -691,7 +912,8 @@ async def handle_chop_command(message: discord.Message) -> None:
 async def on_ready() -> None:
     """Runs when the bot successfully logs in."""
 
-    print(f"Logged in as {client.user}")
+    print(f"Chopper v{BOT_VERSION} logged in as {client.user}")
+    await check_permissions_on_startup()
 
 
 @client.event
@@ -701,7 +923,13 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    if not message.content.lower().startswith(f"{COMMAND_WORD} "):
+    if not message.content.lower().startswith(COMMAND_WORD):
+        return
+
+    # Only treat the message as a command when it is exactly "chop" or when
+    # it starts with "chop ". This prevents "chopped" from triggering the bot.
+    lowered = message.content.lower()
+    if lowered != COMMAND_WORD and not lowered.startswith(f"{COMMAND_WORD} "):
         return
 
     await handle_chop_command(message)
