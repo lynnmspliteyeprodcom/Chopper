@@ -1,6 +1,6 @@
 #Chopper, an RPS bot for BNS games
 #By Matthew Lynn, 6/20/2026
-#v2.0.4
+#v2.0.7
 
 """
 rps.py
@@ -8,7 +8,7 @@ rps.py
 Discord Rock, Paper, Scissors "Chop" Bot
 
 Version:
-    v2.0.4
+    v2.0.7
 
 Command examples:
     chop
@@ -16,9 +16,14 @@ Command examples:
     chop ?
     chop version
     chop permissions
+    chop clean
+    chop clean-up
+    chop purge
     chop @player rock 7
     chop @player rock
+    chop @player rock ?
     chop reality rock 7
+    chop reality rock ?
     chop bot paper
 
 Terms:
@@ -60,7 +65,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 COMMAND_WORD = "chop"
-BOT_VERSION = "2.0.4"
+BOT_VERSION = "2.0.7"
 
 # Defender response window.
 CHOP_TIMEOUT_SECONDS = 240  # 4 minutes
@@ -493,6 +498,256 @@ async def send_permission_report(message: discord.Message) -> None:
 # Discord UI
 # ---------------------------------------------------------------------------
 
+
+class ChallengerTestPoolModal(Modal):
+    """
+    Private modal used when the Challenger enters ? for the test pool.
+
+    Discord only permits modals to be opened from an interaction, not directly
+    from a prefix-command message. The bot therefore posts a temporary button
+    that the Challenger clicks to open this modal.
+    """
+
+    def __init__(
+        self,
+        original_message: discord.Message,
+        target_text: str,
+        challenger_throw: str,
+    ):
+        super().__init__(title="Enter Challenger Test Pool")
+
+        self.original_message = original_message
+        self.target_text = target_text
+        self.challenger_throw = challenger_throw
+
+        self.test_pool_input = TextInput(
+            label="Test Pool",
+            placeholder="Enter your test pool number",
+            required=True,
+            min_length=1,
+            max_length=6,
+        )
+
+        self.add_item(self.test_pool_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        """Validates the test pool and continues the original challenge."""
+
+        try:
+            challenger_test_pool, _ = parse_test_pool(
+                str(self.test_pool_input.value)
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return
+
+        # Acknowledge the modal before continuing with message operations.
+        await interaction.response.defer(ephemeral=True)
+
+        # Remove the original command now that its data has been captured.
+        await safely_delete_message(self.original_message)
+
+        if self.target_text.lower() in REALITY_KEYWORDS:
+            await handle_reality_challenge(
+                message=self.original_message,
+                challenger_throw=self.challenger_throw,
+                challenger_test_pool=challenger_test_pool,
+                challenger_defaulted_test_pool=False,
+                command_already_deleted=True,
+            )
+            return
+
+        if not self.original_message.mentions:
+            await interaction.followup.send(
+                "I could not identify the Defender for that challenge.",
+                ephemeral=True,
+            )
+            return
+
+        defender = self.original_message.mentions[0]
+
+        await handle_player_challenge(
+            message=self.original_message,
+            defender=defender,
+            challenger_throw=self.challenger_throw,
+            challenger_test_pool=challenger_test_pool,
+            challenger_defaulted_test_pool=False,
+            command_already_deleted=True,
+        )
+
+
+class ChallengerTestPoolView(View):
+    """
+    Temporary interaction used to request a Challenger test pool.
+
+    Only the Challenger may open the modal. The request expires after 60
+    seconds to avoid leaving stale UI in the channel.
+    """
+
+    def __init__(
+        self,
+        original_message: discord.Message,
+        target_text: str,
+        challenger_throw: str,
+    ):
+        super().__init__(timeout=60)
+
+        self.original_message = original_message
+        self.target_text = target_text
+        self.challenger_throw = challenger_throw
+        self.prompt_message: Optional[discord.Message] = None
+
+    @discord.ui.button(
+        label="Enter Test Pool",
+        style=discord.ButtonStyle.primary,
+    )
+    async def enter_test_pool(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        """Opens the private Challenger test-pool modal."""
+
+        if interaction.user.id != self.original_message.author.id:
+            await interaction.response.send_message(
+                "Only the Challenger may enter this test pool.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            ChallengerTestPoolModal(
+                original_message=self.original_message,
+                target_text=self.target_text,
+                challenger_throw=self.challenger_throw,
+            )
+        )
+
+        if self.prompt_message:
+            try:
+                await self.prompt_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        """Deletes the temporary test-pool request if it is ignored."""
+
+        if self.prompt_message:
+            try:
+                await self.prompt_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
+async def request_challenger_test_pool(
+    message: discord.Message,
+    target_text: str,
+    challenger_throw: str,
+) -> None:
+    """
+    Requests the Challenger's test pool when ? is supplied.
+
+    Because Discord cannot launch a modal directly from a prefix-command
+    message, the bot posts a temporary button that opens the private modal.
+    """
+
+    view = ChallengerTestPoolView(
+        original_message=message,
+        target_text=target_text,
+        challenger_throw=challenger_throw,
+    )
+
+    prompt = await message.channel.send(
+        f"{message.author.mention}, click below to enter your test pool.",
+        view=view,
+    )
+
+    view.prompt_message = prompt
+
+
+
+
+class BadCommandHelpView(View):
+    """
+    Short-lived help offer shown after an apparent malformed Chopper command.
+
+    Only the user who triggered the apparent command may use the button.
+    The prompt removes itself after 15 seconds if ignored.
+    """
+
+    def __init__(self, requester: discord.Member):
+        super().__init__(timeout=15)
+        self.requester = requester
+        self.prompt_message: Optional[discord.Message] = None
+
+    @discord.ui.button(
+        label="Show Help",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def show_help(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        """Shows the normal Chopper help output to the requesting user."""
+
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message(
+                "Only the user who triggered this prompt may request the help output.",
+                ephemeral=True,
+            )
+            return
+
+        # Acknowledge the button first, then remove the temporary prompt.
+        await interaction.response.defer()
+
+        if self.prompt_message:
+            try:
+                await self.prompt_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        # Reuse the standard help renderer so there is only one source of truth.
+        await send_chop_help_from_channel(interaction.channel)
+
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        """Deletes the help offer after 15 seconds."""
+
+        if self.prompt_message:
+            try:
+                await self.prompt_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
+async def offer_help_for_bad_command(message: discord.Message) -> None:
+    """
+    Offers help after an apparent malformed Chopper command.
+
+    The prompt is intentionally temporary because messages beginning with
+    "chop " can be false positives in normal conversation.
+    """
+
+    view = BadCommandHelpView(message.author)
+
+    prompt = await message.channel.send(
+        f"{message.author.mention}, that looks like it may have been a Chopper "
+        "command I could not understand. Would you like to see the help output?\n"
+        "*This prompt will automatically expire in 15 seconds.*",
+        view=view,
+    )
+
+    view.prompt_message = prompt
+
+
+
 class TestPoolModal(Modal):
     """Modal used to collect the Defender's private test pool."""
 
@@ -671,21 +926,29 @@ async def send_temporary_error(
     await channel.send(text, delete_after=delete_after)
 
 
-async def send_chop_help(message: discord.Message) -> None:
-    """Displays syntax and rules for the Chop bot."""
+async def send_chop_help_from_channel(
+    channel: discord.abc.Messageable,
+) -> None:
+    """Displays syntax and rules for the Chop bot in the supplied channel."""
 
     help_text = (
         f"**CHOP HELP — v{BOT_VERSION}**\n\n"
         "**Challenge another player:**\n"
         "`chop @player rock 7`\n"
-        "`chop @player rock` — test pool defaults to 0\n\n"
+        "`chop @player rock` — test pool defaults to 0\n"
+        "`chop @player rock ?` — opens a private test-pool entry box\n\n"
         "**Challenge Reality:**\n"
         "`chop reality rock 7`\n"
+        "`chop reality rock ?` — opens a private test-pool entry box\n"
         "`chop bot rock` — test pool defaults to 0\n\n"
         "**Other commands:**\n"
         "`chop help`\n"
         "`chop ?`\n"
-        "`chop version`\n\n"
+        "`chop version`\n"
+        "`chop permissions`\n"
+        "`chop clean` — remove Chopper-related posts from this channel\n"
+        "`chop clean-up` — alias for `chop clean`\n"
+        "`chop purge` — alias for `chop clean`\n\n"
         "**Valid throws:**\n"
         "`rock`, `paper`, `scissors`\n"
         "Aliases: `r`, `p`, `s`\n\n"
@@ -696,13 +959,22 @@ async def send_chop_help(message: discord.Message) -> None:
         "• If both players choose the same throw, the higher test pool wins.\n"
         "• Test pool numbers are never shown publicly.\n"
         "• If a test pool is not entered, it defaults to 0.\n"
+        "• Enter `?` as the test pool to be prompted for private test-pool entry.\n"
         "• If both throw and test pool tie, advantage falls to the Defender.\n"
         "• The Defender may Relent, which is an automatic loss.\n"
         "• Against Reality, tied throws favor the Challenger.\n"
-        "• Player Defenders have 4 minutes to respond."
+        "• Player Defenders have 4 minutes to respond.\n"
+        "• If a message appears to be a malformed Chopper command, Chopper will offer help.\n"
+        "• That help offer automatically expires after 15 seconds if ignored."
     )
 
-    await message.channel.send(help_text)
+    await channel.send(help_text)
+
+
+async def send_chop_help(message: discord.Message) -> None:
+    """Displays syntax and rules for the Chop bot."""
+
+    await send_chop_help_from_channel(message.channel)
 
 
 async def safely_delete_message(message: discord.Message) -> None:
@@ -730,6 +1002,7 @@ async def handle_reality_challenge(
     challenger_throw: str,
     challenger_test_pool: int,
     challenger_defaulted_test_pool: bool,
+    command_already_deleted: bool = False,
 ) -> None:
     """
     Resolves a chop directly against Reality.
@@ -753,7 +1026,9 @@ async def handle_reality_challenge(
     winner, reason = resolve_chop(state)
     result_message = build_result_message(state, winner, reason)
 
-    await safely_delete_message(message)
+    if not command_already_deleted:
+        await safely_delete_message(message)
+
     await message.channel.send(result_message)
 
 
@@ -763,6 +1038,7 @@ async def handle_player_challenge(
     challenger_throw: str,
     challenger_test_pool: int,
     challenger_defaulted_test_pool: bool,
+    command_already_deleted: bool = False,
 ) -> None:
     """Creates a player-vs-player challenge."""
 
@@ -782,7 +1058,8 @@ async def handle_player_challenge(
         )
         return
 
-    await safely_delete_message(message)
+    if not command_already_deleted:
+        await safely_delete_message(message)
 
     state = ChopState(
         challenger=challenger,
@@ -810,14 +1087,19 @@ async def handle_chop_command(message: discord.Message) -> None:
         chop
         chop @player rock
         chop @player rock 7
+        chop @player rock ?
         chop reality rock
         chop reality rock 7
+        chop reality rock ?
         chop bot rock
         chop bot rock 7
         chop help
         chop ?
         chop version
         chop permissions
+        chop clean
+        chop clean-up
+        chop purge
     """
 
     parts = message.content.split()
@@ -841,16 +1123,17 @@ async def handle_chop_command(message: discord.Message) -> None:
         await send_permission_report(message)
         return
 
+    if subcommand in {"clean", "clean-up", "purge"}:
+        await clean_chopper_posts(message)
+        return
+
     # Valid challenge forms are:
     #     chop @player rock
     #     chop @player rock 7
     #     chop reality rock
     #     chop reality rock 7
     if len(parts) not in {3, 4}:
-        await send_temporary_error(
-            message.channel,
-            "Use `chop help` for syntax.",
-        )
+        await offer_help_for_bad_command(message)
         return
 
     _, target_text, throw_text, *test_pool_parts = parts
@@ -859,18 +1142,25 @@ async def handle_chop_command(message: discord.Message) -> None:
 
     # If no rock/paper/scissors value is entered, tell the user and close out.
     if challenger_throw is None:
-        await send_temporary_error(
-            message.channel,
-            "No valid throw was entered. Use `rock`, `paper`, or `scissors`.",
-        )
+        await offer_help_for_bad_command(message)
         return
 
     test_pool_text = test_pool_parts[0] if test_pool_parts else None
 
+    # A question mark requests private entry of the Challenger's test pool.
+    # The challenge continues only after the Challenger submits the modal.
+    if test_pool_text == "?":
+        await request_challenger_test_pool(
+            message=message,
+            target_text=target_text,
+            challenger_throw=challenger_throw,
+        )
+        return
+
     try:
         challenger_test_pool, challenger_defaulted = parse_test_pool(test_pool_text)
-    except ValueError as exc:
-        await send_temporary_error(message.channel, str(exc))
+    except ValueError:
+        await offer_help_for_bad_command(message)
         return
 
     # Reality challenge.
@@ -887,10 +1177,7 @@ async def handle_chop_command(message: discord.Message) -> None:
         return
 
     if not message.mentions:
-        await send_temporary_error(
-            message.channel,
-            "You need to challenge a player, like this: `chop @player rock 7`.",
-        )
+        await offer_help_for_bad_command(message)
         return
 
     defender = message.mentions[0]
@@ -902,6 +1189,108 @@ async def handle_chop_command(message: discord.Message) -> None:
         challenger_test_pool=challenger_test_pool,
         challenger_defaulted_test_pool=challenger_defaulted,
     )
+
+
+
+async def clean_chopper_posts(message: discord.Message) -> None:
+    """
+    Removes Chopper-related traffic from the current channel.
+
+    Command aliases:
+        chop clean
+        chop clean-up
+        chop purge
+
+    A message qualifies for removal when either:
+        1. It was posted by this bot, or
+        2. Its text starts with "chop " case-insensitively.
+
+    The substring check is intentionally LIKE-style rather than command-style.
+    This means malformed Chopper attempts are still found even when they never
+    activated the bot.
+
+    The cleanup is limited to the channel where the command is issued.
+    Individual deletes are used so older messages can also be removed.
+    """
+
+    if message.guild is None:
+        await message.channel.send(
+            "Cleanup can only be run inside a server channel."
+        )
+        return
+
+    # Cleanup can remove many messages, so restrict it to members who already
+    # have Discord's Manage Messages permission in this channel.
+    user_permissions = message.channel.permissions_for(message.author)
+
+    if not user_permissions.manage_messages:
+        await message.channel.send(
+            "You need the Manage Messages permission to use Chopper cleanup.",
+            delete_after=12,
+        )
+        return
+
+    if message.guild.me is None:
+        await message.channel.send(
+            "I could not determine my server permissions.",
+            delete_after=12,
+        )
+        return
+
+    bot_permissions = message.channel.permissions_for(message.guild.me)
+
+    if not bot_permissions.manage_messages:
+        await message.channel.send(
+            "I need Manage Messages permission in this channel to clean up posts.",
+            delete_after=12,
+        )
+        return
+
+    bot_user_id = client.user.id if client.user else None
+
+    deleted_bot_posts = 0
+    deleted_chop_posts = 0
+    failed_deletes = 0
+
+    async for history_message in message.channel.history(
+        limit=None,
+        oldest_first=False,
+    ):
+        is_chopper_post = (
+            bot_user_id is not None
+            and history_message.author.id == bot_user_id
+        )
+
+        # LIKE-style "chop %" match. This finds messages whose content starts
+        # with "chop " (case-insensitively), including malformed commands that
+        # failed to activate Chopper. It does not match ordinary words such as
+        # "chopper", "chopping", or messages where "chop" appears later.
+        contains_chop = history_message.content.casefold().startswith("chop ")
+
+        if not is_chopper_post and not contains_chop:
+            continue
+
+        try:
+            await history_message.delete()
+
+            if is_chopper_post:
+                deleted_bot_posts += 1
+            else:
+                deleted_chop_posts += 1
+
+        except (discord.Forbidden, discord.HTTPException):
+            failed_deletes += 1
+
+    # The cleanup command itself is normally deleted by the scan because it
+    # contains "chop". Leave only a temporary completion summary.
+    summary = (
+        "**Chopper Cleanup Complete**\n\n"
+        f"Chopper posts removed: {deleted_bot_posts}\n"
+        f"User posts containing `chop` removed: {deleted_chop_posts}\n"
+        f"Failed deletions: {failed_deletes}"
+    )
+
+    await message.channel.send(summary, delete_after=15)
 
 
 # ---------------------------------------------------------------------------
