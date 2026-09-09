@@ -3,7 +3,7 @@
 #v2.0.12
 
 """
-rps.py
+rps.py 
 
 Discord Rock, Paper, Scissors "Chop" Bot
 
