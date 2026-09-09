@@ -1,6 +1,6 @@
 #Chopper, an RPS bot for BNS games
 #By Matthew Lynn, 6/20/2026
-#v2.0.12
+#v2.0.13
 
 """
 rps.py
@@ -8,7 +8,7 @@ rps.py
 Discord Rock, Paper, Scissors "Chop" Bot
 
 Version:
-    v2.0.12
+    v2.0.13
 
 Command examples:
     chop
@@ -67,7 +67,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 COMMAND_WORD = "chop"
-BOT_VERSION = "2.0.12"
+BOT_VERSION = "2.0.13"
 
 # Defender response window.
 CHOP_TIMEOUT_SECONDS = 240  # 4 minutes
@@ -1097,6 +1097,17 @@ class ChopView(View):
 # Command Helpers
 # ---------------------------------------------------------------------------
 
+async def prepare_utility_command(message: discord.Message) -> None:
+    """
+    Best-effort removal of a recognized Chopper utility command.
+
+    Utility commands should not leave unnecessary user command posts behind,
+    but cleanup failure must never prevent the requested utility from running.
+    """
+
+    await delete_message_quietly(message)
+
+
 async def send_temporary_error(
     channel: discord.abc.Messageable,
     text: str,
@@ -1304,24 +1315,29 @@ async def handle_chop_command(message: discord.Message) -> None:
 
     # Bare "chop" should behave exactly like help.
     if len(parts) == 1:
+        await prepare_utility_command(message)
         await send_chop_help(message)
         return
 
     subcommand = parts[1].lower()
 
     if subcommand in HELP_SUBCOMMANDS:
+        await prepare_utility_command(message)
         await send_chop_help(message)
         return
 
     if subcommand == "version":
+        await prepare_utility_command(message)
         await message.channel.send(f"Chopper Version: v{BOT_VERSION}")
         return
 
     if subcommand == "permissions":
+        await prepare_utility_command(message)
         await send_permission_report(message)
         return
 
     if subcommand in CLEANUP_SUBCOMMANDS:
+        await prepare_utility_command(message)
         await clean_chopper_posts(message)
         return
 
