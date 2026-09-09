@@ -1,6 +1,6 @@
 #Chopper, an RPS bot for BNS games
 #By Matthew Lynn, 6/20/2026
-#v2.0.7
+#v2.0.12
 
 """
 rps.py
@@ -8,7 +8,7 @@ rps.py
 Discord Rock, Paper, Scissors "Chop" Bot
 
 Version:
-    v2.0.7
+    v2.0.12
 
 Command examples:
     chop
@@ -22,8 +22,10 @@ Command examples:
     chop @player rock 7
     chop @player rock
     chop @player rock ?
+    chop @player ? ?
     chop reality rock 7
     chop reality rock ?
+    chop reality ? ?
     chop bot paper
 
 Terms:
@@ -49,7 +51,7 @@ from __future__ import annotations
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
 
 import discord
 from discord.ui import Button, Modal, TextInput, View
@@ -65,10 +67,17 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 COMMAND_WORD = "chop"
-BOT_VERSION = "2.0.7"
+BOT_VERSION = "2.0.12"
 
 # Defender response window.
 CHOP_TIMEOUT_SECONDS = 240  # 4 minutes
+BAD_COMMAND_HELP_TIMEOUT_SECONDS = 15
+TEST_POOL_PROMPT_TIMEOUT_SECONDS = 60
+TEMPORARY_ERROR_SECONDS = 12
+CLEANUP_SUMMARY_SECONDS = 15
+
+HELP_SUBCOMMANDS = {"help", "?"}
+CLEANUP_SUBCOMMANDS = {"clean", "clean-up", "purge"}
 
 # Reality is the bot-controlled opponent.
 REALITY_NAME = "Reality"
@@ -78,6 +87,12 @@ REALITY_KEYWORDS = {"reality", "bot"}
 REALITY_TEST_POOL = -1
 
 VALID_THROWS = {"rock", "paper", "scissors"}
+THROW_ALIASES = {
+    "r": "rock",
+    "p": "paper",
+    "s": "scissors",
+    "scissor": "scissors",
+}
 
 # Each key defeats the listed value.
 WIN_MAP = {
@@ -116,12 +131,14 @@ intents.members = True
 
 client = discord.Client(intents=intents)
 
+_startup_permission_check_complete = False
+
 
 # ---------------------------------------------------------------------------
 # Data Model
 # ---------------------------------------------------------------------------
 
-Player = Union[discord.Member, str]
+Player = discord.Member | str
 
 
 @dataclass
@@ -166,14 +183,7 @@ def normalize_throw(value: str) -> Optional[str]:
 
     value = value.lower().strip()
 
-    aliases = {
-        "r": "rock",
-        "p": "paper",
-        "s": "scissors",
-        "scissor": "scissors",
-    }
-
-    value = aliases.get(value, value)
+    value = THROW_ALIASES.get(value, value)
 
     if value in VALID_THROWS:
         return value
@@ -350,6 +360,46 @@ def parse_test_pool(value: Optional[str]) -> tuple[int, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Discord Utility Helpers
+# ---------------------------------------------------------------------------
+
+async def delete_message_quietly(
+    message: Optional[discord.Message],
+) -> None:
+    """Deletes a message without surfacing cleanup-only Discord errors."""
+
+    if message is None:
+        return
+
+    try:
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def reject_unauthorized_interaction(
+    interaction: discord.Interaction,
+    expected_user_id: int,
+    error_text: str,
+) -> bool:
+    """
+    Rejects an interaction from anyone except the expected user.
+
+    Returns True when the interaction was rejected so callers can simply
+    return from the callback.
+    """
+
+    if interaction.user.id == expected_user_id:
+        return False
+
+    await interaction.response.send_message(
+        error_text,
+        ephemeral=True,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Permission Checks
 # ---------------------------------------------------------------------------
 
@@ -499,6 +549,129 @@ async def send_permission_report(message: discord.Message) -> None:
 # ---------------------------------------------------------------------------
 
 
+class ChallengerThrowButton(Button):
+    """Button used when the Challenger enters ? instead of a throw."""
+
+    def __init__(
+        self,
+        throw: str,
+        original_message: discord.Message,
+        target_text: str,
+    ):
+        super().__init__(
+            label=format_throw(throw),
+            style=discord.ButtonStyle.primary,
+        )
+
+        self.throw = throw
+        self.original_message = original_message
+        self.target_text = target_text
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """
+        Records the Challenger's throw and immediately opens test-pool entry.
+
+        Because the button click is a Discord interaction, Chopper can open the
+        private modal directly here without requiring a second button.
+        """
+
+        if await reject_unauthorized_interaction(
+            interaction,
+            self.original_message.author.id,
+            "Only the Challenger may choose this throw.",
+        ):
+            return
+
+        await interaction.response.send_modal(
+            ChallengerTestPoolModal(
+                original_message=self.original_message,
+                target_text=self.target_text,
+                challenger_throw=self.throw,
+            )
+        )
+
+        view = self.view
+        if isinstance(view, ChallengerThrowView):
+            await delete_message_quietly(view.prompt_message)
+            view.stop()
+
+
+class ChallengerThrowView(View):
+    """
+    Temporary Rock/Paper/Scissors selector for the Challenger.
+
+    Used by:
+        chop @player ? ?
+        chop reality ? ?
+    """
+
+    def __init__(
+        self,
+        original_message: discord.Message,
+        target_text: str,
+    ):
+        super().__init__(timeout=TEST_POOL_PROMPT_TIMEOUT_SECONDS)
+
+        self.original_message = original_message
+        self.target_text = target_text
+        self.prompt_message: Optional[discord.Message] = None
+
+        self.add_item(
+            ChallengerThrowButton(
+                "rock",
+                original_message,
+                target_text,
+            )
+        )
+        self.add_item(
+            ChallengerThrowButton(
+                "paper",
+                original_message,
+                target_text,
+            )
+        )
+        self.add_item(
+            ChallengerThrowButton(
+                "scissors",
+                original_message,
+                target_text,
+            )
+        )
+
+    async def on_timeout(self) -> None:
+        """Deletes the temporary throw selector if it is ignored."""
+
+        await delete_message_quietly(self.prompt_message)
+
+
+async def request_challenger_throw(
+    message: discord.Message,
+    target_text: str,
+) -> None:
+    """
+    Requests a private Challenger throw when ? replaces rock/paper/scissors.
+
+    The original command is deleted before Chopper posts the selector. If
+    deletion fails, the challenge is cancelled to avoid exposing game input.
+    """
+
+    if not await delete_challenger_command(message):
+        return
+
+    view = ChallengerThrowView(
+        original_message=message,
+        target_text=target_text,
+    )
+
+    prompt = await message.channel.send(
+        f"{message.author.mention}, choose your throw.",
+        view=view,
+    )
+
+    view.prompt_message = prompt
+
+
+
 class ChallengerTestPoolModal(Modal):
     """
     Private modal used when the Challenger enters ? for the test pool.
@@ -545,10 +718,8 @@ class ChallengerTestPoolModal(Modal):
             return
 
         # Acknowledge the modal before continuing with message operations.
+        # The original chop was already deleted before this modal was offered.
         await interaction.response.defer(ephemeral=True)
-
-        # Remove the original command now that its data has been captured.
-        await safely_delete_message(self.original_message)
 
         if self.target_text.lower() in REALITY_KEYWORDS:
             await handle_reality_challenge(
@@ -593,7 +764,7 @@ class ChallengerTestPoolView(View):
         target_text: str,
         challenger_throw: str,
     ):
-        super().__init__(timeout=60)
+        super().__init__(timeout=TEST_POOL_PROMPT_TIMEOUT_SECONDS)
 
         self.original_message = original_message
         self.target_text = target_text
@@ -611,11 +782,11 @@ class ChallengerTestPoolView(View):
     ) -> None:
         """Opens the private Challenger test-pool modal."""
 
-        if interaction.user.id != self.original_message.author.id:
-            await interaction.response.send_message(
-                "Only the Challenger may enter this test pool.",
-                ephemeral=True,
-            )
+        if await reject_unauthorized_interaction(
+            interaction,
+            self.original_message.author.id,
+            "Only the Challenger may enter this test pool.",
+        ):
             return
 
         await interaction.response.send_modal(
@@ -626,22 +797,14 @@ class ChallengerTestPoolView(View):
             )
         )
 
-        if self.prompt_message:
-            try:
-                await self.prompt_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        await delete_message_quietly(self.prompt_message)
 
         self.stop()
 
     async def on_timeout(self) -> None:
         """Deletes the temporary test-pool request if it is ignored."""
 
-        if self.prompt_message:
-            try:
-                await self.prompt_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        await delete_message_quietly(self.prompt_message)
 
 
 async def request_challenger_test_pool(
@@ -652,9 +815,17 @@ async def request_challenger_test_pool(
     """
     Requests the Challenger's test pool when ? is supplied.
 
+    The original command contains the Challenger's throw, so it must be
+    removed before Chopper posts any follow-up UI. If Chopper cannot delete
+    the command, the challenge is aborted rather than exposing the throw.
+
     Because Discord cannot launch a modal directly from a prefix-command
-    message, the bot posts a temporary button that opens the private modal.
+    message, the bot then posts a temporary button that opens the private
+    modal.
     """
+
+    if not await delete_challenger_command(message):
+        return
 
     view = ChallengerTestPoolView(
         original_message=message,
@@ -670,8 +841,6 @@ async def request_challenger_test_pool(
     view.prompt_message = prompt
 
 
-
-
 class BadCommandHelpView(View):
     """
     Short-lived help offer shown after an apparent malformed Chopper command.
@@ -681,7 +850,7 @@ class BadCommandHelpView(View):
     """
 
     def __init__(self, requester: discord.Member):
-        super().__init__(timeout=15)
+        super().__init__(timeout=BAD_COMMAND_HELP_TIMEOUT_SECONDS)
         self.requester = requester
         self.prompt_message: Optional[discord.Message] = None
 
@@ -696,21 +865,17 @@ class BadCommandHelpView(View):
     ) -> None:
         """Shows the normal Chopper help output to the requesting user."""
 
-        if interaction.user.id != self.requester.id:
-            await interaction.response.send_message(
-                "Only the user who triggered this prompt may request the help output.",
-                ephemeral=True,
-            )
+        if await reject_unauthorized_interaction(
+            interaction,
+            self.requester.id,
+            "Only the user who triggered this prompt may request the help output.",
+        ):
             return
 
         # Acknowledge the button first, then remove the temporary prompt.
         await interaction.response.defer()
 
-        if self.prompt_message:
-            try:
-                await self.prompt_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        await delete_message_quietly(self.prompt_message)
 
         # Reuse the standard help renderer so there is only one source of truth.
         await send_chop_help_from_channel(interaction.channel)
@@ -720,11 +885,7 @@ class BadCommandHelpView(View):
     async def on_timeout(self) -> None:
         """Deletes the help offer after 15 seconds."""
 
-        if self.prompt_message:
-            try:
-                await self.prompt_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        await delete_message_quietly(self.prompt_message)
 
 
 async def offer_help_for_bad_command(message: discord.Message) -> None:
@@ -745,7 +906,6 @@ async def offer_help_for_bad_command(message: discord.Message) -> None:
     )
 
     view.prompt_message = prompt
-
 
 
 class TestPoolModal(Modal):
@@ -772,11 +932,18 @@ class TestPoolModal(Modal):
 
         defender_id = get_player_id(self.state.defender)
 
-        if defender_id is None or interaction.user.id != defender_id:
+        if defender_id is None:
             await interaction.response.send_message(
-                "Only the Defender may respond to this challenge.",
+                "This challenge no longer has a valid Defender.",
                 ephemeral=True,
             )
+            return
+
+        if await reject_unauthorized_interaction(
+            interaction,
+            defender_id,
+            "Only the Defender may respond to this challenge.",
+        ):
             return
 
         try:
@@ -822,11 +989,18 @@ class ThrowButton(Button):
 
         defender_id = get_player_id(self.state.defender)
 
-        if defender_id is None or interaction.user.id != defender_id:
+        if defender_id is None:
             await interaction.response.send_message(
-                "Only the Defender may answer this challenge.",
+                "This challenge no longer has a valid Defender.",
                 ephemeral=True,
             )
+            return
+
+        if await reject_unauthorized_interaction(
+            interaction,
+            defender_id,
+            "Only the Defender may answer this challenge.",
+        ):
             return
 
         if self.state.resolved:
@@ -855,11 +1029,18 @@ class RelentButton(Button):
 
         defender_id = get_player_id(self.state.defender)
 
-        if defender_id is None or interaction.user.id != defender_id:
+        if defender_id is None:
             await interaction.response.send_message(
-                "Only the Defender may answer this challenge.",
+                "This challenge no longer has a valid Defender.",
                 ephemeral=True,
             )
+            return
+
+        if await reject_unauthorized_interaction(
+            interaction,
+            defender_id,
+            "Only the Defender may answer this challenge.",
+        ):
             return
 
         if self.state.resolved:
@@ -919,7 +1100,7 @@ class ChopView(View):
 async def send_temporary_error(
     channel: discord.abc.Messageable,
     text: str,
-    delete_after: int = 12,
+    delete_after: int = TEMPORARY_ERROR_SECONDS,
 ) -> None:
     """Sends a short-lived error message."""
 
@@ -936,10 +1117,12 @@ async def send_chop_help_from_channel(
         "**Challenge another player:**\n"
         "`chop @player rock 7`\n"
         "`chop @player rock` — test pool defaults to 0\n"
-        "`chop @player rock ?` — opens a private test-pool entry box\n\n"
+        "`chop @player rock ?` — prompts for private test-pool entry\n"
+        "`chop @player ? ?` — prompts for throw, then private test-pool entry\n\n"
         "**Challenge Reality:**\n"
         "`chop reality rock 7`\n"
-        "`chop reality rock ?` — opens a private test-pool entry box\n"
+        "`chop reality rock ?` — prompts for private test-pool entry\n"
+        "`chop reality ? ?` — prompts for throw, then private test-pool entry\n"
         "`chop bot rock` — test pool defaults to 0\n\n"
         "**Other commands:**\n"
         "`chop help`\n"
@@ -960,6 +1143,7 @@ async def send_chop_help_from_channel(
         "• Test pool numbers are never shown publicly.\n"
         "• If a test pool is not entered, it defaults to 0.\n"
         "• Enter `?` as the test pool to be prompted for private test-pool entry.\n"
+        "• Enter `? ?` for throw and test pool to choose the throw with buttons, then enter the test pool privately.\n"
         "• If both throw and test pool tie, advantage falls to the Defender.\n"
         "• The Defender may Relent, which is an automatic loss.\n"
         "• Against Reality, tied throws favor the Challenger.\n"
@@ -977,24 +1161,32 @@ async def send_chop_help(message: discord.Message) -> None:
     await send_chop_help_from_channel(message.channel)
 
 
-async def safely_delete_message(message: discord.Message) -> None:
+async def delete_challenger_command(message: discord.Message) -> bool:
     """
-    Deletes a message when possible.
+    Deletes the Challenger's original command before any chop continues.
 
-    This is important because the original command includes the Challenger's
-    throw and possibly their test pool.
+    Returns True only when the command was successfully removed. If deletion
+    fails, Chopper cancels the challenge so the Challenger's throw is not
+    exposed.
     """
 
     try:
         await message.delete()
+        return True
     except discord.Forbidden:
         await message.channel.send(
-            "I need Manage Messages permission to hide chop commands properly.",
-            delete_after=12,
+            "**Chop Cancelled**\n"
+            "The chop was unable to proceed due to a technical issue.",
+            delete_after=TEMPORARY_ERROR_SECONDS,
         )
+        return False
     except discord.HTTPException:
-        # Ignore transient Discord API errors.
-        pass
+        await message.channel.send(
+            "**Chop Cancelled**\n"
+            "The chop was unable to proceed due to a technical issue.",
+            delete_after=TEMPORARY_ERROR_SECONDS,
+        )
+        return False
 
 
 async def handle_reality_challenge(
@@ -1027,7 +1219,8 @@ async def handle_reality_challenge(
     result_message = build_result_message(state, winner, reason)
 
     if not command_already_deleted:
-        await safely_delete_message(message)
+        if not await delete_challenger_command(message):
+            return
 
     await message.channel.send(result_message)
 
@@ -1059,7 +1252,8 @@ async def handle_player_challenge(
         return
 
     if not command_already_deleted:
-        await safely_delete_message(message)
+        if not await delete_challenger_command(message):
+            return
 
     state = ChopState(
         challenger=challenger,
@@ -1088,9 +1282,13 @@ async def handle_chop_command(message: discord.Message) -> None:
         chop @player rock
         chop @player rock 7
         chop @player rock ?
+        chop @player ? ?
+    chop @player ? ?
         chop reality rock
         chop reality rock 7
         chop reality rock ?
+        chop reality ? ?
+    chop reality ? ?
         chop bot rock
         chop bot rock 7
         chop help
@@ -1111,7 +1309,7 @@ async def handle_chop_command(message: discord.Message) -> None:
 
     subcommand = parts[1].lower()
 
-    if subcommand in {"help", "?"}:
+    if subcommand in HELP_SUBCOMMANDS:
         await send_chop_help(message)
         return
 
@@ -1123,7 +1321,7 @@ async def handle_chop_command(message: discord.Message) -> None:
         await send_permission_report(message)
         return
 
-    if subcommand in {"clean", "clean-up", "purge"}:
+    if subcommand in CLEANUP_SUBCOMMANDS:
         await clean_chopper_posts(message)
         return
 
@@ -1138,14 +1336,38 @@ async def handle_chop_command(message: discord.Message) -> None:
 
     _, target_text, throw_text, *test_pool_parts = parts
 
-    challenger_throw = normalize_throw(throw_text)
+    is_reality_target = target_text.casefold() in REALITY_KEYWORDS
 
-    # If no rock/paper/scissors value is entered, tell the user and close out.
-    if challenger_throw is None:
+    # Validate the target before requesting any private Challenger input.
+    if not is_reality_target and not message.mentions:
         await offer_help_for_bad_command(message)
         return
 
     test_pool_text = test_pool_parts[0] if test_pool_parts else None
+
+    # New private-input form:
+    #     chop @player ? ?
+    #     chop reality ? ?
+    #
+    # The first ? presents Rock/Paper/Scissors buttons. Selecting a throw is
+    # an interaction, so Chopper can immediately open the private test-pool
+    # modal from that click.
+    if throw_text == "?":
+        if test_pool_text != "?":
+            await offer_help_for_bad_command(message)
+            return
+
+        await request_challenger_throw(
+            message=message,
+            target_text=target_text,
+        )
+        return
+
+    challenger_throw = normalize_throw(throw_text)
+
+    if challenger_throw is None:
+        await offer_help_for_bad_command(message)
+        return
 
     # A question mark requests private entry of the Challenger's test pool.
     # The challenge continues only after the Challenger submits the modal.
@@ -1167,17 +1389,13 @@ async def handle_chop_command(message: discord.Message) -> None:
     #
     # Check this before mention handling so the keyword is reserved and
     # behaves predictably.
-    if target_text.lower() in REALITY_KEYWORDS:
+    if is_reality_target:
         await handle_reality_challenge(
             message=message,
             challenger_throw=challenger_throw,
             challenger_test_pool=challenger_test_pool,
             challenger_defaulted_test_pool=challenger_defaulted,
         )
-        return
-
-    if not message.mentions:
-        await offer_help_for_bad_command(message)
         return
 
     defender = message.mentions[0]
@@ -1189,7 +1407,6 @@ async def handle_chop_command(message: discord.Message) -> None:
         challenger_test_pool=challenger_test_pool,
         challenger_defaulted_test_pool=challenger_defaulted,
     )
-
 
 
 async def clean_chopper_posts(message: discord.Message) -> None:
@@ -1205,9 +1422,9 @@ async def clean_chopper_posts(message: discord.Message) -> None:
         1. It was posted by this bot, or
         2. Its text starts with "chop " case-insensitively.
 
-    The substring check is intentionally LIKE-style rather than command-style.
-    This means malformed Chopper attempts are still found even when they never
-    activated the bot.
+    The prefix check intentionally behaves like SQL `LIKE 'chop %'` rather
+    than validating command syntax. Malformed attempts are therefore still
+    found, while unrelated words such as "chopper" are left alone.
 
     The cleanup is limited to the channel where the command is issued.
     Individual deletes are used so older messages can also be removed.
@@ -1286,11 +1503,14 @@ async def clean_chopper_posts(message: discord.Message) -> None:
     summary = (
         "**Chopper Cleanup Complete**\n\n"
         f"Chopper posts removed: {deleted_bot_posts}\n"
-        f"User posts containing `chop` removed: {deleted_chop_posts}\n"
+        f"User posts matching `chop %` removed: {deleted_chop_posts}\n"
         f"Failed deletions: {failed_deletes}"
     )
 
-    await message.channel.send(summary, delete_after=15)
+    await message.channel.send(
+        summary,
+        delete_after=CLEANUP_SUMMARY_SECONDS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1299,10 +1519,17 @@ async def clean_chopper_posts(message: discord.Message) -> None:
 
 @client.event
 async def on_ready() -> None:
-    """Runs when the bot successfully logs in."""
+    """Runs when the bot successfully logs in or reconnects."""
+
+    global _startup_permission_check_complete
 
     print(f"Chopper v{BOT_VERSION} logged in as {client.user}")
-    await check_permissions_on_startup()
+
+    # on_ready() can run again after a reconnect. The permission report only
+    # needs to be printed once per process start.
+    if not _startup_permission_check_complete:
+        await check_permissions_on_startup()
+        _startup_permission_check_complete = True
 
 
 @client.event
